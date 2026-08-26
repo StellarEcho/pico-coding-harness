@@ -597,14 +597,62 @@ def is_effectively_empty(state, workspace_root=None):
 
 
 class LayeredMemory:
+    backend_id = "keyword"
+
     def __init__(self, state=None, workspace_root=None):
         self.workspace_root = workspace_root
         self.state = normalize_memory_state(state, workspace_root)
         self.durable_store = DurableMemoryStore(Path(workspace_root) / ".pico" / "memory") if workspace_root is not None else None
 
+    @property
+    def durable(self):
+        return self.durable_store is not None
+
     def to_dict(self):
         self.state = normalize_memory_state(self.state, self.workspace_root)
         return self.state
+
+    def store(self, note):
+        """MemoryBackend 协议：写入一条记忆并返回规范化后的 note。"""
+        if isinstance(note, str):
+            text = str(note).strip()
+            tags = ()
+            source = ""
+            kind = "episodic"
+        else:
+            note = dict(note or {})
+            text = str(note.get("text", "") or "").strip()
+            tags = note.get("tags", ())
+            source = str(note.get("source", "") or "").strip()
+            kind = str(note.get("kind", "episodic") or "episodic").strip() or "episodic"
+        if not text:
+            return {"text": "", "tags": [], "source": "", "created_at": now(), "note_index": 0, "kind": "episodic"}
+        self.append_note(text, tags=tags, source=source, kind=kind)
+        for candidate in reversed(self.state["episodic_notes"]):
+            if candidate["text"] == text:
+                return dict(candidate)
+        return {"text": text, "tags": list(tags), "source": source, "created_at": now(), "note_index": 0, "kind": kind}
+
+    def retrieve(self, query, limit=3):
+        return self.retrieval_candidates(query, limit=limit)
+
+    def delete(self, key):
+        """MemoryBackend 协议：按文本精确删除 episodic note，返回删除条数。"""
+        text = str(key or "").strip()
+        if not text:
+            return 0
+        before = len(self.state["episodic_notes"])
+        self.state["episodic_notes"] = [note for note in self.state["episodic_notes"] if note["text"] != text]
+        removed = before - len(self.state["episodic_notes"])
+        if removed:
+            self.state["notes"] = [note["text"] for note in self.state["episodic_notes"]]
+        return removed
+
+    def snapshot(self):
+        return self.to_dict()
+
+    def render_text(self):
+        return self.render_memory_text()
 
     def canonical_path(self, path):
         return canonicalize_path(path, self.workspace_root)

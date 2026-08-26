@@ -15,13 +15,15 @@ from pathlib import Path
 from . import checkpoint as checkpointlib
 from . import compaction as compactionlib
 from .features import memory as memorylib
+from .features import memory_backends as memory_backendslib
 from . import planner as plannerlib
+from .features import skills as skillslib
 from . import security as securitylib
 from .context_manager import ContextManager
 from .checkpoint import CHECKPOINT_NONE_STATUS
 from .prompt_prefix import build_prompt_prefix, tool_signature
 from .run_store import RunStore
-from .security import REDACTED_VALUE
+from .security import REDACTED_VALUE, SECRET_SHAPED_TEXT_PATTERN
 from .session_store import SessionStore
 from .tool_context import ToolContext
 from .tool_executor import ToolExecutor
@@ -36,6 +38,7 @@ DEFAULT_FEATURE_FLAGS = {
     "prompt_cache": True,
     "plan": True,
     "compaction": True,
+    "skills": True,
 }
 DURABLE_MEMORY_INTENT_PATTERN = re.compile(r"(?i)\b(capture|remember|save|store|persist|note)\b")
 DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(r"(记住|保存|记录|沉淀|长期记忆|持久记忆)")
@@ -49,8 +52,6 @@ DURABLE_MEMORY_LINE_PATTERNS = (
     ("dependency-facts", re.compile(r"^依赖：\s*(.+)$")),
     ("user-preferences", re.compile(r"^偏好：\s*(.+)$")),
 )
-SECRET_SHAPED_TEXT_PATTERN = re.compile(r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,})")
-
 __all__ = ["Pico", "SessionStore"]
 
 
@@ -73,6 +74,7 @@ class Pico:
         feature_flags=None,
         allowed_tools=None,
         plan_auto_init_after=3,
+        memory_backend="keyword",
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -91,6 +93,7 @@ class Pico:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.plan_auto_init_after = max(1, int(plan_auto_init_after))
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
+        self.memory_backend = str(memory_backend or "keyword").strip().lower()
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".pico" / "runs")
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
@@ -104,11 +107,13 @@ class Pico:
         self.session["plan"] = self.plan.to_dict()
         self.estimator = compactionlib.TokenEstimator()
         self.compaction_policy = compactionlib.CompactionPolicy(estimator=self.estimator)
-        self.memory = memorylib.LayeredMemory(
-            self.session.setdefault("memory", memorylib.default_memory_state()),
+        self.memory = memory_backendslib.create_memory_backend(
+            self.memory_backend,
             workspace_root=self.root,
+            state=self.session.setdefault("memory", memorylib.default_memory_state()),
         )
-        self.session["memory"] = self.memory.to_dict()
+        self.skills = skillslib.SkillRegistry.load(workspace_root=self.root)
+        self.session["memory"] = self.memory.snapshot()
         self.tools = self._apply_tool_allowlist(self.build_tools())
         self.tool_executor = ToolExecutor(self)
         self.prefix_state = self.build_prefix()
@@ -257,6 +262,9 @@ class Pico:
         stats["summary_chars"] = len("\n".join(state.get("summary_entries", []) or []))
         stats["summary_lines"] = len(state.get("summary_entries", []) or [])
         return stats
+
+    def skills_summary(self):
+        return self.skills.render()
 
     def auto_init_plan(self, user_message):
         """模型一直不调用 update_plan 时，runtime 兜底生成占位计划。
@@ -675,6 +683,7 @@ class Pico:
             "durable_superseded": list(self.last_durable_superseded),
             "plan": self.plan.metrics(),
             "compaction": self.compaction_stats(),
+            "skills": self.skills.summary(),
             "redacted_env": self.detected_secret_env_summary(),
         }
 
@@ -876,7 +885,11 @@ class Pico:
         self.session["history"] = []
         self.session["memory"].clear()
         self.session["memory"].update(memorylib.default_memory_state())
-        self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
+        self.memory = memory_backendslib.create_memory_backend(
+            self.memory_backend,
+            workspace_root=self.root,
+            state=self.session["memory"],
+        )
         self.plan.reset()
         self.session["plan"] = self.plan.to_dict()
         self.session["compaction"] = compactionlib.default_compaction_state()
