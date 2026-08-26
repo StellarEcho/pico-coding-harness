@@ -6,12 +6,13 @@ Agent Harness v1 is Pico's current runtime shape: a local control loop around a 
 
 1. Build workspace context and runtime prefix.
 2. Record the user request in session history.
-3. Create task state for the run.
-4. Build bounded prompt context.
-5. Request the model response.
-6. Parse the response into a tool call, retry notice, or final answer.
-7. Execute tools through runtime policy.
-8. Write task state, trace events, checkpoints, and report artifacts.
+3. Reset or retain the task plan for the request.
+4. Create task state for the run.
+5. Build bounded prompt context.
+6. Request the model response.
+7. Parse the response into a tool call, retry notice, or final answer.
+8. Execute tools through runtime policy.
+9. Write task state, trace events, checkpoints, and report artifacts.
 
 ## State Artifacts
 

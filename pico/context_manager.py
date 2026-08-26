@@ -15,17 +15,20 @@ DEFAULT_SECTION_BUDGETS = {
     "prefix": 3600,
     "memory": 1600,
     "relevant_memory": 1200,
+    "plan": 900,
     "history": 5200,
 }
 DEFAULT_SECTION_FLOORS = {
     "prefix": 1200,
     "memory": 400,
     "relevant_memory": 300,
+    "plan": 225,
     "history": 1500,
 }
 # 当 prompt 超预算时，会优先压缩这些 section。
-DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "memory", "prefix")
-SECTION_ORDER = ("prefix", "memory", "relevant_memory", "history", "current_request")
+# plan 放在 history 前面压缩：对多步任务，当前计划比旧历史更值得保留。
+DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "plan", "memory", "prefix")
+SECTION_ORDER = ("prefix", "memory", "relevant_memory", "plan", "history", "current_request")
 CURRENT_REQUEST_SECTION = "current_request"
 RELEVANT_MEMORY_LIMIT = 3
 
@@ -189,6 +192,7 @@ class ContextManager:
         else:
             relevant_lines.append("- none")
         relevant_raw = "\n".join(relevant_lines)
+        plan_raw = self._plan_raw_text()
         history = list(getattr(self.agent, "session", {}).get("history", []))
         history_raw = self._raw_history_text(history)
         return {
@@ -205,6 +209,12 @@ class ContextManager:
                     "rendered_count": len(selected_notes),
                     "note_budget": 0,
                 },
+            ),
+            "plan": SectionRender(
+                raw=plan_raw,
+                budget=len(plan_raw),
+                rendered=plan_raw,
+                details=self._plan_details(),
             ),
             "history": SectionRender(raw=history_raw, budget=len(history_raw), rendered=history_raw, details={"rendered_entries": []}),
             CURRENT_REQUEST_SECTION: SectionRender(
@@ -232,6 +242,8 @@ class ContextManager:
                 rendered[section] = SectionRender(raw=raw, budget=0, rendered=raw, details={})
             elif section == "relevant_memory":
                 rendered[section] = self._render_relevant_memory(selected_notes or [], int(budget or 0))
+            elif section == "plan":
+                rendered[section] = self._render_plan_section(int(budget or 0))
             elif section == "history":
                 rendered[section] = self._render_history_section(int(budget or 0))
             else:
@@ -239,6 +251,38 @@ class ContextManager:
                 rendered_text = _tail_clip(raw, int(budget)) if budget is not None else raw
                 rendered[section] = SectionRender(raw=raw, budget=int(budget) if budget is not None else 0, rendered=rendered_text, details={})
         return rendered
+
+    def _plan_raw_text(self):
+        plan = getattr(self.agent, "plan", None)
+        if plan is None:
+            return "Plan:\n- none"
+        return str(plan.render() or "Plan:\n- none")
+
+    def _plan_details(self):
+        plan = getattr(self.agent, "plan", None)
+        if plan is None:
+            return {
+                "title": "",
+                "step_count": 0,
+                "status_counts": {},
+                "next_pending": None,
+            }
+        metrics = plan.metrics()
+        return {
+            "title": metrics.get("title", ""),
+            "step_count": int(metrics.get("step_count", 0) or 0),
+            "status_counts": dict(metrics.get("status_counts", {}) or {}),
+            "next_pending": metrics.get("next_pending"),
+        }
+
+    def _render_plan_section(self, budget):
+        raw = self._plan_raw_text()
+        details = self._plan_details()
+        if budget <= 0:
+            rendered = ""
+        else:
+            rendered = _tail_clip(raw, int(budget))
+        return SectionRender(raw=raw, budget=int(budget), rendered=rendered, details=details)
 
     def _render_relevant_memory(self, selected_notes, budget):
         header = "Relevant memory:"
@@ -448,6 +492,7 @@ class ContextManager:
                 rendered["prefix"].rendered,
                 rendered["memory"].rendered,
                 rendered["relevant_memory"].rendered,
+                rendered["plan"].rendered,
                 rendered["history"].rendered,
                 rendered[CURRENT_REQUEST_SECTION].rendered,
             ]
@@ -499,6 +544,14 @@ class ContextManager:
                 "collapsed_duplicate_reads": int(rendered["history"].details.get("collapsed_duplicate_reads", 0)),
                 "reused_file_summary_count": int(rendered["history"].details.get("reused_file_summary_count", 0)),
                 "summarized_tool_count": int(rendered["history"].details.get("summarized_tool_count", 0)),
+            },
+            "plan": {
+                "title": str(rendered["plan"].details.get("title", "") or ""),
+                "step_count": int(rendered["plan"].details.get("step_count", 0) or 0),
+                "status_counts": dict(rendered["plan"].details.get("status_counts", {}) or {}),
+                "next_pending": rendered["plan"].details.get("next_pending"),
+                "raw_chars": rendered["plan"].raw_chars,
+                "rendered_chars": rendered["plan"].rendered_chars,
             },
             "current_request": {
                 "text": user_message,

@@ -45,6 +45,7 @@ HELP_DETAILS = textwrap.dedent(
     Commands:
     /help    Show this help message.
     /memory  Show the agent's distilled working memory.
+    /plan    Show the agent's current task plan.
     /session Show the path to the saved session file.
     /reset   Clear the current session history and memory.
     /exit    Exit the agent.
@@ -346,6 +347,9 @@ def main(argv=None):
             continue
         if user_input == "/memory":
             print(agent.memory_text())
+            continue
+        if user_input == "/plan":
+            print(agent.plan.render())
             continue
         if user_input == "/session":
             print(agent.session_path)

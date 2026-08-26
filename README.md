@@ -235,6 +235,7 @@ uv run pico --provider ollama --model qwen3.5:4b
 
 - `/help`：查看内置命令
 - `/memory`：查看提炼后的工作记忆
+- `/plan`：查看当前任务计划
 - `/session`：查看当前会话文件路径
 - `/reset`：清空当前会话状态
 - `/exit` 或 `/quit`：退出 REPL

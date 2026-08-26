@@ -126,15 +126,24 @@ def render_checkpoint_text(agent):
         lines.append("- Excluded: " + " | ".join(str(item) for item in checkpoint.get("excluded", [])))
     if agent.resume_state.get("stale_paths"):
         lines.append("- Stale paths: " + ", ".join(agent.resume_state["stale_paths"]))
+    plan = getattr(agent, "plan", None)
+    if plan is not None and plan.state.get("steps"):
+        steps = plan.state["steps"]
+        done = sum(1 for step in steps if step["status"] == "done")
+        lines.append(f"- Plan progress: {done}/{len(steps)} steps done")
     summary = str(checkpoint.get("summary", "")).strip()
     if summary:
         lines.append(f"- Summary: {summary}")
     return "\n".join(lines)
 
 
-def infer_next_step(task_state):
+def infer_next_step(task_state, plan=None):
     if task_state.status == "completed":
         return "No next step recorded."
+    if plan is not None:
+        next_pending = plan.next_pending()
+        if next_pending:
+            return f"Step {next_pending['id']}: {next_pending['text']}"
     if task_state.stop_reason == "step_limit_reached":
         return "Resume from the latest checkpoint and continue the task."
     if task_state.last_tool:
@@ -146,6 +155,8 @@ def create_checkpoint(agent, task_state, user_message, trigger):
     state = checkpoint_state(agent)
     current = current_checkpoint(agent)
     checkpoint_id = "ckpt_" + uuid.uuid4().hex[:8]
+    plan = getattr(agent, "plan", None)
+    plan_title = str(plan.state.get("title", "")).strip() if plan is not None else ""
     key_files = []
     freshness = {}
     for path in agent.memory.to_dict()["working"]["recent_files"]:
@@ -157,11 +168,11 @@ def create_checkpoint(agent, task_state, user_message, trigger):
         "parent_checkpoint_id": current.get("checkpoint_id", "") if current else "",
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "created_at": now(),
-        "current_goal": str(user_message),
+        "current_goal": plan_title or str(user_message),
         "completed": [task_state.final_answer] if task_state.final_answer else [],
         "excluded": [],
         "current_blocker": "" if str(task_state.stop_reason or "") in ("", "final_answer_returned") else str(task_state.stop_reason),
-        "next_step": infer_next_step(task_state),
+        "next_step": infer_next_step(task_state, plan=plan),
         "key_files": key_files,
         "freshness": freshness,
         "summary": f"{trigger}: {clip(str(user_message), 120)}",

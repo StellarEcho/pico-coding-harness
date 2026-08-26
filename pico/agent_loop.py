@@ -138,6 +138,9 @@ class AgentLoop:
                 "user_request": clip(user_message, 300),
             },
         )
+        # 新请求先重置计划，同一请求续跑则保留旧计划；
+        # 之后每轮 prompt 里的 plan section 都会带上最新状态。
+        agent.ensure_plan_for_request(user_message)
 
         tool_steps = 0
         attempts = 0

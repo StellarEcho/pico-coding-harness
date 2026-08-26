@@ -97,3 +97,75 @@ def test_agent_loop_persists_model_failure_before_reraising(tmp_path):
     report = agent.run_store.load_report(state.run_id)
     assert report["stop_reason"] == "model_error"
     assert report["prompt_metadata"]["stop_reason"] == "max_tokens"
+
+
+def test_agent_loop_creates_plan_via_update_plan_and_uses_it_in_prompts_and_checkpoints(tmp_path):
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"update_plan","args":{"action":"init","title":"Fix failing tests","plan":"1. Reproduce the failure\\n2. Locate the faulty code\\n3. Patch the implementation\\n4. Run pytest"}}</tool>',
+            '<tool>{"name":"update_plan","args":{"action":"update","step_id":1,"status":"done","note":"fails on parser"}}</tool>',
+            '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":1}}</tool>',
+            "<final>Done.</final>",
+        ],
+    )
+
+    answer = agent.ask("Fix the failing tests")
+
+    assert answer == "Done."
+    assert agent.current_task_state.status == "completed"
+    assert agent.plan.state["title"] == "Fix failing tests"
+    assert agent.plan.state["steps"][0]["status"] == "done"
+    assert agent.plan.state["steps"][0]["note"] == "fails on parser"
+    assert agent.plan.state["steps"][1]["status"] == "pending"
+
+    prompts = agent.model_client.prompts
+    assert "- [ ] 1. Reproduce the failure" in prompts[1]
+    assert "- [x] 1. Reproduce the failure -- fails on parser" in prompts[2]
+
+    checkpoints = agent.checkpoint_state()["items"]
+    assert any(
+        item["current_goal"] == "Fix failing tests" and item["next_step"] == "Step 2: Locate the faulty code"
+        for item in checkpoints.values()
+    )
+
+    trace_path = agent.run_store.trace_path(agent.current_task_state)
+    trace_events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert any(event["event"] == "plan_reset" for event in trace_events)
+
+    report = agent.run_store.load_report(agent.current_task_state.run_id)
+    assert report["plan"]["step_count"] == 4
+    assert report["plan"]["status_counts"]["done"] == 1
+    assert report["plan"]["next_pending"] == {"id": 2, "text": "Locate the faulty code"}
+
+
+def test_plan_survives_resume_and_resets_on_new_request(tmp_path):
+    agent = build_agent(tmp_path, ["<final>Done.</final>"])
+    agent.plan.reset(request="Fix tests")
+    agent.plan.apply({"action": "init", "title": "Fix tests", "plan": "1. Reproduce\n2. Patch"})
+    agent.session["plan"] = agent.plan.to_dict()
+    agent.session_path = agent.session_store.save(agent.session)
+
+    resumed = Pico.from_session(
+        model_client=FakeModelClient(["<final>Done.</final>"]),
+        workspace=agent.workspace,
+        session_store=agent.session_store,
+        session_id=agent.session["id"],
+    )
+
+    assert resumed.ensure_plan_for_request("Fix tests") is False
+    assert [step["text"] for step in resumed.plan.state["steps"]] == ["Reproduce", "Patch"]
+
+    assert resumed.ensure_plan_for_request("Fix the docs instead") is True
+    assert resumed.plan.state["request"] == "Fix the docs instead"
+    assert resumed.plan.state["steps"] == []
+
+
+def test_plan_feature_disabled_hides_update_plan_tool(tmp_path):
+    agent = build_agent(tmp_path, [], feature_flags={"plan": False})
+
+    prompt = agent.prompt("Do something")
+
+    assert "- update_plan(" not in prompt
+    result = agent.run_tool("update_plan", {"action": "init", "title": "T", "plan": "1. A"})
+    assert result == "error: unknown tool 'update_plan'"

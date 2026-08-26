@@ -1133,7 +1133,7 @@ def test_prompt_budget_metadata_records_budget_decisions(tmp_path):
     prompt_events = [event for event in trace_events if event["event"] == "prompt_built"]
     assert prompt_events
     metadata = prompt_events[0]["prompt_metadata"]
-    relevant_section = agent.model_client.prompts[0].split("Relevant memory:\n", 1)[1].split("\n\nTranscript:", 1)[0]
+    relevant_section = agent.model_client.prompts[0].split("Relevant memory:\n", 1)[1].split("\n\nPlan:", 1)[0]
 
     assert metadata["relevant_memory"]["selected_count"] == 3
     assert len(metadata["relevant_memory"]["rendered_notes"]) == 3

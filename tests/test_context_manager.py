@@ -33,7 +33,14 @@ def test_context_manager_assembles_sections_in_expected_order(tmp_path):
     assert prompt.index("Relevant memory:") < prompt.index("Transcript:")
     assert prompt.index("Transcript:") < prompt.index("Current user request:")
     assert prompt.rstrip().endswith("Current user request:\nWhere is the deploy key?")
-    assert metadata["section_order"] == ["prefix", "memory", "relevant_memory", "history", "current_request"]
+    assert metadata["section_order"] == [
+        "prefix",
+        "memory",
+        "relevant_memory",
+        "plan",
+        "history",
+        "current_request",
+    ]
 
 
 def test_context_manager_reduces_relevant_memory_before_history_and_preserves_newer_context(tmp_path):
@@ -83,11 +90,12 @@ def test_context_manager_renders_top_three_episodic_notes_per_note_under_budget(
 
     prompt, metadata = ContextManager(
         agent,
-        total_budget=250,
+        total_budget=300,
         section_budgets={
             "prefix": 60,
             "memory": 60,
             "relevant_memory": 80,
+            "plan": 60,
             "history": 60,
         },
     ).build("recall")
@@ -104,7 +112,7 @@ def test_context_manager_renders_top_three_episodic_notes_per_note_under_budget(
     assert metadata["relevant_memory"]["rendered_notes"][0].startswith("gamma episodi")
     assert metadata["relevant_memory"]["rendered_notes"][1].startswith("alpha episodi")
     assert metadata["relevant_memory"]["rendered_notes"][2].startswith("beta episodi")
-    relevant_section = prompt.split("Relevant memory:\n", 1)[1].split("\n\nTranscript:", 1)[0]
+    relevant_section = prompt.split("Relevant memory:\n", 1)[1].split("\n\nPlan:", 1)[0]
     assert len([line for line in relevant_section.splitlines() if line.startswith("- ")]) == 3
     assert "alpha episodi" in relevant_section
     assert "beta episodic" in relevant_section
@@ -237,3 +245,94 @@ def test_context_manager_relevant_memory_can_mix_durable_notes(tmp_path):
     assert metadata["relevant_memory"]["selected_durable_count"] == 1
     assert metadata["relevant_memory"]["selected_sources"] == ["project-conventions"]
     assert metadata["relevant_memory"]["selected_kinds"] == ["durable"]
+
+
+def _seed_plan(agent):
+    agent.plan.reset(request="Fix failing tests")
+    agent.plan.apply(
+        {
+            "action": "init",
+            "title": "Fix failing tests",
+            "plan": "1. Reproduce the failure\n2. Locate the faulty code\n3. Run pytest",
+        }
+    )
+    agent.plan.apply({"action": "update", "step_id": 1, "status": "done"})
+    agent.session["plan"] = agent.plan.to_dict()
+
+
+def test_context_manager_renders_plan_between_relevant_memory_and_history(tmp_path):
+    agent = build_agent(tmp_path, [])
+    _seed_plan(agent)
+
+    prompt, metadata = ContextManager(agent).build("Fix the failing tests")
+
+    assert prompt.index("Relevant memory:") < prompt.index("Plan: Fix failing tests") < prompt.index("Transcript:")
+    assert "- [x] 1. Reproduce the failure" in prompt
+    assert "- [ ] 2. Locate the faulty code" in prompt
+    assert metadata["section_order"] == [
+        "prefix",
+        "memory",
+        "relevant_memory",
+        "plan",
+        "history",
+        "current_request",
+    ]
+    assert metadata["plan"]["title"] == "Fix failing tests"
+    assert metadata["plan"]["step_count"] == 3
+    assert metadata["plan"]["status_counts"] == {"pending": 2, "done": 1}
+    assert metadata["plan"]["next_pending"] == {"id": 2, "text": "Locate the faulty code"}
+
+
+def test_context_manager_renders_empty_plan_when_no_steps(tmp_path):
+    agent = build_agent(tmp_path, [])
+
+    prompt, metadata = ContextManager(agent).build("Inspect the repo")
+
+    assert "Plan:\n- none" in prompt
+    assert metadata["plan"]["step_count"] == 0
+    assert metadata["plan"]["next_pending"] is None
+
+
+def test_context_manager_plan_section_survives_no_reduction_path(tmp_path):
+    agent = build_agent(tmp_path, [], feature_flags={"context_reduction": False})
+    _seed_plan(agent)
+
+    prompt, metadata = ContextManager(agent).build("Fix the failing tests")
+
+    assert "Plan: Fix failing tests" in prompt
+    assert "- [x] 1. Reproduce the failure" in prompt
+    assert metadata["plan"]["step_count"] == 3
+
+
+def test_context_manager_reduces_plan_section_under_budget_pressure(tmp_path):
+    agent = build_agent(tmp_path, [])
+    _seed_plan(agent)
+    agent.prefix = "PREFIX " + ("A" * 600)
+    agent.memory.render_memory_text = lambda: "MEMORY " + ("B" * 600)
+    for minute in range(1, 7):
+        role = "user" if minute % 2 == 1 else "assistant"
+        agent.record(
+            {
+                "role": role,
+                "content": f"recent-{minute} " + ("C" * 180),
+                "created_at": f"2026-04-07T10:0{minute}:00+00:00",
+            }
+        )
+
+    prompt, metadata = ContextManager(
+        agent,
+        total_budget=440,
+        section_budgets={
+            "prefix": 120,
+            "memory": 120,
+            "relevant_memory": 120,
+            "plan": 120,
+            "history": 200,
+        },
+    ).build("keep this request verbatim")
+
+    reduction_sections = [entry["section"] for entry in metadata["budget_reductions"]]
+    assert reduction_sections
+    assert "plan" in reduction_sections
+    assert metadata["sections"]["plan"]["rendered_chars"] <= metadata["sections"]["plan"]["budget_chars"]
+    assert "keep this request verbatim" in prompt

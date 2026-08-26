@@ -14,6 +14,7 @@ from pathlib import Path
 
 from . import checkpoint as checkpointlib
 from .features import memory as memorylib
+from . import planner as plannerlib
 from . import security as securitylib
 from .context_manager import ContextManager
 from .checkpoint import CHECKPOINT_NONE_STATUS
@@ -32,6 +33,7 @@ DEFAULT_FEATURE_FLAGS = {
     "relevant_memory": True,
     "context_reduction": True,
     "prompt_cache": True,
+    "plan": True,
 }
 DURABLE_MEMORY_INTENT_PATTERN = re.compile(r"(?i)\b(capture|remember|save|store|persist|note)\b")
 DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(r"(记住|保存|记录|沉淀|长期记忆|持久记忆)")
@@ -94,6 +96,8 @@ class Pico:
             "memory": memorylib.default_memory_state(),
         }
         self._ensure_session_shape()
+        self.plan = plannerlib.PlanManager(self.session["plan"])
+        self.session["plan"] = self.plan.to_dict()
         self.memory = memorylib.LayeredMemory(
             self.session.setdefault("memory", memorylib.default_memory_state()),
             workspace_root=self.root,
@@ -132,6 +136,7 @@ class Pico:
     def _ensure_session_shape(self):
         self.session.setdefault("history", [])
         self.session.setdefault("memory", memorylib.default_memory_state())
+        self.session.setdefault("plan", plannerlib.default_plan_state())
         checkpoints = self.session.setdefault("checkpoints", {})
         if not isinstance(checkpoints, dict):
             checkpoints = {}
@@ -175,7 +180,39 @@ class Pico:
         del bucket[:-limit]
 
     def build_tools(self):
-        return toolkit.build_tool_registry(self.tool_context())
+        tools = toolkit.build_tool_registry(self.tool_context())
+        if not self.feature_enabled("plan"):
+            # 计划关闭时不能只“忽略”工具调用：模型看到工具却收到空结果
+            # 会困惑。和 delegate 按 depth 隐藏一样，直接从白名单移除。
+            tools.pop("update_plan", None)
+        return tools
+
+    def ensure_plan_for_request(self, user_message):
+        """每个 ask() 开始时调用：新请求重置计划，同一请求保留以便续跑。"""
+        if not self.feature_enabled("plan"):
+            return False
+        request = str(user_message).strip()
+        if self.plan.state.get("request") == request:
+            return False
+        self.plan.reset(request=request)
+        self.session["plan"] = self.plan.to_dict()
+        self.session_path = self.session_store.save(self.session)
+        if self.current_task_state is not None:
+            self.emit_trace(
+                self.current_task_state,
+                "plan_reset",
+                {"request": clip(request, 300), "reason": "new_request"},
+            )
+        return True
+
+    def update_plan(self, args):
+        """update_plan 工具经 ToolContext 注入的回调，纯内存操作。"""
+        if not self.feature_enabled("plan"):
+            raise ValueError("plan feature is disabled")
+        rendered = self.plan.apply(args)
+        self.session["plan"] = self.plan.to_dict()
+        self.session_path = self.session_store.save(self.session)
+        return rendered
 
     @staticmethod
     def _normalize_allowed_tools(allowed_tools):
@@ -565,6 +602,7 @@ class Pico:
             "durable_promotions": list(self.last_durable_promotions),
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
+            "plan": self.plan.metrics(),
             "redacted_env": self.detected_secret_env_summary(),
         }
 
@@ -583,6 +621,7 @@ class Pico:
             depth=self.depth,
             max_depth=self.max_depth,
             spawn_delegate=self.spawn_delegate,
+            plan_update=self.update_plan,
         )
 
     def spawn_delegate(self, args):
@@ -717,7 +756,7 @@ class Pico:
 
         body = match.group("body")
         args = dict(attrs)
-        for key in ("content", "old_text", "new_text", "command", "task", "pattern", "path"):
+        for key in ("content", "old_text", "new_text", "command", "task", "pattern", "path", "plan", "note"):
             if f"<{key}>" in body:
                 args[key] = Pico.extract_raw(body, key)
 
@@ -766,6 +805,8 @@ class Pico:
         self.session["memory"].clear()
         self.session["memory"].update(memorylib.default_memory_state())
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
+        self.plan.reset()
+        self.session["plan"] = self.plan.to_dict()
         self.session_store.save(self.session)
 
     def path(self, raw_path):

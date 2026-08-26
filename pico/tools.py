@@ -42,6 +42,22 @@ BASE_TOOL_SPECS = {
         "risky": True,
         "description": "Replace one exact text block in a file.",
     },
+    "update_plan": {
+        "schema": {
+            "action": "str",
+            "title": "str=''",
+            "plan": "str=''",
+            "step_id": "int=0",
+            "status": "str=''",
+            "note": "str=''",
+        },
+        "risky": False,
+        "description": (
+            "Create or update the active plan. "
+            "action=init: plan is one step per line. "
+            "action=update: mark step_id as done/blocked/in_progress/skipped."
+        ),
+    },
 }
 
 DELEGATE_TOOL_SPEC = {
@@ -61,6 +77,7 @@ TOOL_EXAMPLES = {
     "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
+    "update_plan": '<tool>{"name":"update_plan","args":{"action":"init","title":"Fix failing tests","plan":"1. Reproduce the failure\\n2. Locate the faulty code\\n3. Patch the implementation\\n4. Run pytest"}}</tool>',
     "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
 }
 
@@ -149,6 +166,26 @@ def validate_tool(context, name, args):
             raise ValueError("task must not be empty")
         if context.depth >= context.max_depth:
             raise ValueError("delegate depth exceeded")
+        return
+
+    if name == "update_plan":
+        action = str(args.get("action", "") or "").strip()
+        if action not in {"init", "update"}:
+            raise ValueError("action must be 'init' or 'update'")
+        if action == "init":
+            if not str(args.get("title", "") or "").strip():
+                raise ValueError("plan init requires a non-empty title")
+            if not str(args.get("plan", "") or "").strip():
+                raise ValueError("plan init requires a non-empty plan")
+            return
+        try:
+            step_id = int(args.get("step_id", 0) or 0)
+        except (TypeError, ValueError):
+            raise ValueError("plan update requires an integer step_id") from None
+        if step_id < 1:
+            raise ValueError("plan update requires a positive step_id")
+        if not str(args.get("status", "") or "").strip():
+            raise ValueError("plan update requires a status")
         return
 
 
@@ -273,6 +310,14 @@ def tool_delegate(context, args):
     return context.spawn_delegate(args)
 
 
+def tool_update_plan(context, args):
+    # 计划更新是纯内存操作：不触碰文件系统、不产生工作区变更，
+    # 所以放在 risky=False 的白名单里，不需要审批。
+    if context.plan_update is None:
+        raise ValueError("plan feature is disabled")
+    return context.plan_update(args)
+
+
 _TOOL_RUNNERS = {
     "list_files": tool_list_files,
     "read_file": tool_read_file,
@@ -280,4 +325,5 @@ _TOOL_RUNNERS = {
     "run_shell": tool_run_shell,
     "write_file": tool_write_file,
     "patch_file": tool_patch_file,
+    "update_plan": tool_update_plan,
 }
