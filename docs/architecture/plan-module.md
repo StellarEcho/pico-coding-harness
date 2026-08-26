@@ -17,6 +17,9 @@ Plan 是 agent 的“当前任务工作区”：一个用户请求对应一份�
   -> 模型调用 update_plan 工具
      -> PlanManager.apply()            # 纯内存状态变更
      -> session_store.save()           # 随 session 持久化
+  -> 兜底：连续 N 步工具（默认 3）仍无计划时
+     -> PlanManager.placeholder()      # runtime 自动生成占位计划
+     -> trace: plan_auto_initialized
   -> checkpoint.create_checkpoint()
      -> next_step = plan.next_pending() # resume 时直接续跑
 ```
@@ -31,6 +34,9 @@ Plan 是 agent 的“当前任务工作区”：一个用户请求对应一份�
   plan 排在 history 之后、memory 之前，优先于长期记忆被压缩。
 - feature flag `plan` 关闭时工具从白名单移除（而不是被调用后忽略），
   与 delegate 按 depth 隐藏是同一策略。
+- 模型不调用 `update_plan` 时，runtime 在 `plan_auto_init_after`
+  （默认 3）步工具执行后自动生成占位计划，保证长任务也有可渲染、
+  可推进的计划；模型仍可用 `action=init` 覆盖为具体步骤。
 
 ## 与其他模块的衔接点
 

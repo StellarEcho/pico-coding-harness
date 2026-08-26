@@ -132,11 +132,70 @@ def test_agent_loop_creates_plan_via_update_plan_and_uses_it_in_prompts_and_chec
     trace_path = agent.run_store.trace_path(agent.current_task_state)
     trace_events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
     assert any(event["event"] == "plan_reset" for event in trace_events)
+    assert not any(event["event"] == "plan_auto_initialized" for event in trace_events)
 
     report = agent.run_store.load_report(agent.current_task_state.run_id)
     assert report["plan"]["step_count"] == 4
     assert report["plan"]["status_counts"]["done"] == 1
     assert report["plan"]["next_pending"] == {"id": 2, "text": "Locate the faulty code"}
+
+
+def test_agent_loop_auto_initializes_placeholder_plan_when_model_never_plans(tmp_path):
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
+            '<tool>{"name":"search","args":{"pattern":"demo","path":"."}}</tool>',
+            '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":1}}</tool>',
+            "<final>Done.</final>",
+        ],
+    )
+
+    answer = agent.ask("Inspect the repository and report")
+
+    assert answer == "Done."
+    assert agent.plan.state["title"] == "Inspect the repository and report"
+    assert [step["text"] for step in agent.plan.state["steps"]] == [
+        "Understand the request",
+        "Investigate the workspace",
+        "Implement the change",
+        "Verify with tests",
+    ]
+
+    prompts = agent.model_client.prompts
+    assert "Plan:\n- none" in prompts[0]
+    assert "Plan: Inspect the repository and report" in prompts[3]
+    assert "- [ ] 1. Understand the request" in prompts[3]
+
+    trace_path = agent.run_store.trace_path(agent.current_task_state)
+    trace_events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert any(event["event"] == "plan_auto_initialized" for event in trace_events)
+
+    report = agent.run_store.load_report(agent.current_task_state.run_id)
+    assert report["plan"]["step_count"] == 4
+    assert report["plan"]["status_counts"] == {"pending": 4}
+
+
+def test_plan_auto_init_threshold_is_configurable(tmp_path):
+    (tmp_path / "sample.txt").write_text("alpha\n", encoding="utf-8")
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
+            '<tool>{"name":"search","args":{"pattern":"demo","path":"."}}</tool>',
+            '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":1}}</tool>',
+            '<tool>{"name":"read_file","args":{"path":"sample.txt","start":1,"end":1}}</tool>',
+            "<final>Done.</final>",
+        ],
+        plan_auto_init_after=5,
+    )
+
+    assert agent.ask("Inspect the repo") == "Done."
+
+    assert agent.plan.state["steps"] == []
+    trace_path = agent.run_store.trace_path(agent.current_task_state)
+    trace_events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert not any(event["event"] == "plan_auto_initialized" for event in trace_events)
 
 
 def test_plan_survives_resume_and_resets_on_new_request(tmp_path):

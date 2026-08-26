@@ -33,6 +33,13 @@ STEP_STATUS_MARKERS = {
 
 PLAN_ACTIONS = ("init", "update")
 
+DEFAULT_PLACEHOLDER_STEPS = (
+    "Understand the request",
+    "Investigate the workspace",
+    "Implement the change",
+    "Verify with tests",
+)
+
 # 行首去除编号/圆点/破折号时使用，避免 lstrip 误吞“3-D rendering”这类内容。
 _STEP_PREFIX_PATTERN = re.compile(r"^\s*(?:\d+[.)]?\s*|[-*•]\s*)")
 
@@ -114,6 +121,21 @@ class PlanManager:
         self.state = default_plan_state()
         self.state["request"] = str(request or "").strip()
         self.state["title"] = _tail_clip(str(title or "").strip(), PLAN_TITLE_LIMIT)
+        self.state["updated_at"] = now()
+        return self
+
+    def placeholder(self, request, title=None):
+        """模型没有主动建计划时，由 runtime 兜底生成占位计划。
+
+        占位步骤是通用的“理解 -> 调查 -> 实现 -> 验证”，模型看到后
+        可以用 action=init 覆盖成更具体的计划，或继续推进这些步骤。
+        """
+        self.state["request"] = str(request or "").strip()
+        self.state["title"] = _tail_clip(str(title or request or "Task").strip(), PLAN_TITLE_LIMIT)
+        self.state["steps"] = [
+            {"id": index + 1, "text": text, "status": "pending", "note": ""}
+            for index, text in enumerate(DEFAULT_PLACEHOLDER_STEPS)
+        ]
         self.state["updated_at"] = now()
         return self
 

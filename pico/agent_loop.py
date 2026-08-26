@@ -244,6 +244,11 @@ class AgentLoop:
                         **dict(tool_result.metadata or {}),
                     },
                 )
+                # 兜底：模型连续执行工具却始终不建计划时，
+                # runtime 自动生成占位计划，下一轮 prompt 就能看到。
+                # 阈值可配置（plan_auto_init_after），模型已建过计划则跳过。
+                if tool_steps >= getattr(agent, "plan_auto_init_after", 3):
+                    agent.auto_init_plan(user_message)
                 checkpoint = agent.create_checkpoint(task_state, user_message, trigger="tool_executed")
                 agent.run_store.write_task_state(task_state)
                 agent.emit_trace(

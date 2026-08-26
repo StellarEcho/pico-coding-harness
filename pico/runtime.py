@@ -70,6 +70,7 @@ class Pico:
         secret_env_names=None,
         feature_flags=None,
         allowed_tools=None,
+        plan_auto_init_after=3,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -86,6 +87,7 @@ class Pico:
         self.feature_flags = dict(DEFAULT_FEATURE_FLAGS)
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
+        self.plan_auto_init_after = max(1, int(plan_auto_init_after))
         self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".pico" / "runs")
         self.session = session or {
@@ -213,6 +215,32 @@ class Pico:
         self.session["plan"] = self.plan.to_dict()
         self.session_path = self.session_store.save(self.session)
         return rendered
+
+    def auto_init_plan(self, user_message):
+        """模型一直不调用 update_plan 时，runtime 兜底生成占位计划。
+
+        只有计划仍为空时才生效；模型已经建过计划或 plan feature 关闭时
+        不会覆盖。生成后写 trace，下一轮 prompt 的 plan section 就会出现
+        占位计划，模型仍可用 action=init 覆盖成具体步骤。
+        """
+        if not self.feature_enabled("plan"):
+            return False
+        if self.plan.state.get("steps"):
+            return False
+        self.plan.placeholder(user_message)
+        self.session["plan"] = self.plan.to_dict()
+        self.session_path = self.session_store.save(self.session)
+        if self.current_task_state is not None:
+            self.emit_trace(
+                self.current_task_state,
+                "plan_auto_initialized",
+                {
+                    "reason": "model_did_not_plan",
+                    "step_count": len(self.plan.state["steps"]),
+                    "title": self.plan.state["title"],
+                },
+            )
+        return True
 
     @staticmethod
     def _normalize_allowed_tools(allowed_tools):

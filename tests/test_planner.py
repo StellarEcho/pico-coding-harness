@@ -188,6 +188,24 @@ def test_reset_clears_steps_and_sets_request():
     assert plan.state["title"] == ""
 
 
+def test_placeholder_generates_generic_steps_and_keeps_request():
+    plan = PlanManager()
+    plan.reset(request="Fix tests")
+
+    plan.placeholder("Fix tests")
+
+    assert plan.state["request"] == "Fix tests"
+    assert plan.state["title"] == "Fix tests"
+    assert [step["text"] for step in plan.state["steps"]] == [
+        "Understand the request",
+        "Investigate the workspace",
+        "Implement the change",
+        "Verify with tests",
+    ]
+    assert all(step["status"] == "pending" for step in plan.state["steps"])
+    assert plan.next_pending() == {"id": 1, "text": "Understand the request"}
+
+
 def test_to_dict_round_trip_preserves_plan():
     plan = PlanManager()
     plan.reset(request="Fix tests")
