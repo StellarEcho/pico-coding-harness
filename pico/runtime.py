@@ -55,6 +55,48 @@ DURABLE_MEMORY_LINE_PATTERNS = (
 __all__ = ["Pico", "SessionStore"]
 
 
+def _skill_hook_after_tool(agent, payload):
+    metadata = dict(payload.get("metadata", {}) or {})
+    status = str(metadata.get("tool_status", "") or "")
+    if status not in {"error", "partial_success", "rejected"}:
+        return {}
+    name = str(payload.get("name", "") or "")
+    affected = [str(path) for path in metadata.get("affected_paths", []) or []]
+    path_text = ", ".join(affected) or "workspace"
+    note_text = f"skill after_tool: {name} {status} on {path_text}"
+    agent.memory.append_note(note_text, tags=("skill", status), source="skill:after_tool", kind="process")
+    agent.session["memory"] = agent.memory.snapshot()
+    return {"note": note_text}
+
+
+def _skill_hook_plan_updated(agent, payload):
+    metrics = agent.plan.metrics()
+    if not metrics["step_count"]:
+        return {}
+    next_step = metrics.get("next_pending") or "-"
+    note_text = f"skill plan_updated: {metrics['step_count']} steps, next: {next_step}"
+    agent.memory.append_note(note_text, tags=("skill", "plan"), source="skill:plan_updated", kind="process")
+    agent.session["memory"] = agent.memory.snapshot()
+    return {"note": note_text}
+
+
+def _skill_hook_context_compacted(agent, payload):
+    folded = int(payload.get("entries_folded", 0) or 0)
+    if folded <= 0:
+        return {}
+    note_text = f"skill context_compacted: {folded} entries folded into summary"
+    agent.memory.append_note(note_text, tags=("skill", "compaction"), source="skill:context_compacted", kind="process")
+    agent.session["memory"] = agent.memory.snapshot()
+    return {"note": note_text}
+
+
+SKILL_HOOK_HANDLERS = {
+    "after_tool": _skill_hook_after_tool,
+    "plan_updated": _skill_hook_plan_updated,
+    "context_compacted": _skill_hook_context_compacted,
+}
+
+
 class Pico:
     def __init__(
         self,
@@ -92,7 +134,13 @@ class Pico:
         if feature_flags:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.plan_auto_init_after = max(1, int(plan_auto_init_after))
-        self.allowed_tools = self._normalize_allowed_tools(allowed_tools)
+        self.skills = skillslib.SkillRegistry.load(workspace_root=self.root)
+        allowed_tools_normalized = self._normalize_allowed_tools(allowed_tools)
+        if allowed_tools_normalized is not None and self.feature_enabled("skills"):
+            # skill 声明需要的工具自动并入本次运行的允许集合；
+            # skill manifest 在加载时已保证工具名存在于 legal 白名单。
+            allowed_tools_normalized = tuple(sorted(set(allowed_tools_normalized) | set(self.skills.tool_names())))
+        self.allowed_tools = allowed_tools_normalized
         self.memory_backend = str(memory_backend or "keyword").strip().lower()
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".pico" / "runs")
         self.session = session or {
@@ -112,7 +160,6 @@ class Pico:
             workspace_root=self.root,
             state=self.session.setdefault("memory", memorylib.default_memory_state()),
         )
-        self.skills = skillslib.SkillRegistry.load(workspace_root=self.root)
         self.session["memory"] = self.memory.snapshot()
         self.tools = self._apply_tool_allowlist(self.build_tools())
         self.tool_executor = ToolExecutor(self)
@@ -197,6 +244,9 @@ class Pico:
             # 计划关闭时不能只“忽略”工具调用：模型看到工具却收到空结果
             # 会困惑。和 delegate 按 depth 隐藏一样，直接从白名单移除。
             tools.pop("update_plan", None)
+        if not self.feature_enabled("memory"):
+            for name in ("memory_read", "memory_update"):
+                tools.pop(name, None)
         return tools
 
     def ensure_plan_for_request(self, user_message):
@@ -224,7 +274,49 @@ class Pico:
         rendered = self.plan.apply(args)
         self.session["plan"] = self.plan.to_dict()
         self.session_path = self.session_store.save(self.session)
+        self.dispatch_skill_hooks("plan_updated", {"action": str(args.get("action", "") or "").strip()})
         return rendered
+
+    def memory_read(self, args):
+        """memory_read 工具回调：从工作记忆和 durable 记忆里召回。"""
+        query = str(args.get("query", "") or "").strip()
+        limit = int(args.get("limit", 3))
+        return self.memory.retrieval_view(query, limit=limit)
+
+    def memory_update(self, args):
+        """memory_update 工具回调：增删 durable 记忆。"""
+        if not self.feature_enabled("memory"):
+            raise ValueError("memory feature is disabled")
+        action = str(args.get("action", "add") or "add").strip()
+        topic = str(args.get("topic", "") or "").strip()
+        note = str(args.get("note", "") or "").strip()
+        if action == "add":
+            changed = self.memory.add_durable(topic, note)
+            self.session["memory"] = self.memory.snapshot()
+            return f"added durable note to {topic}" if changed else f"durable note already exists in {topic}"
+        removed = self.memory.remove_durable(topic, note)
+        self.session["memory"] = self.memory.snapshot()
+        return f"removed {removed} note(s) from {topic}"
+
+    def dispatch_skill_hooks(self, event, payload=None):
+        """触发订阅了该事件的 enabled skill；每个 hook 写一条 trace。"""
+        if not self.feature_enabled("skills"):
+            return []
+        fired = []
+        payload = dict(payload or {})
+        for skill_id in self.skills.hooks_for(event):
+            outcome = {}
+            handler = SKILL_HOOK_HANDLERS.get(str(event))
+            if handler is not None:
+                try:
+                    outcome = dict(handler(self, payload) or {})
+                except Exception as exc:
+                    outcome = {"error": str(exc)}
+            record = {"skill_id": skill_id, "hook_event": str(event), "outcome": outcome}
+            fired.append(record)
+            if self.current_task_state is not None:
+                self.emit_trace(self.current_task_state, "skill_hook_triggered", record)
+        return fired
 
     def compact_history(self, trigger="manual"):
         """执行一次上下文压缩，写 session 和 trace，返回 decision 或 None。"""
@@ -236,6 +328,7 @@ class Pico:
         self.session_path = self.session_store.save(self.session)
         if self.current_task_state is not None:
             self.emit_trace(self.current_task_state, "context_compacted", decision.to_dict())
+        self.dispatch_skill_hooks("context_compacted", decision.to_dict())
         return decision
 
     def maybe_compact(self, prompt_metadata, tool_steps):
@@ -703,6 +796,8 @@ class Pico:
             max_depth=self.max_depth,
             spawn_delegate=self.spawn_delegate,
             plan_update=self.update_plan,
+            memory_query=self.memory_read,
+            memory_update=self.memory_update,
         )
 
     def spawn_delegate(self, args):
@@ -837,7 +932,7 @@ class Pico:
 
         body = match.group("body")
         args = dict(attrs)
-        for key in ("content", "old_text", "new_text", "command", "task", "pattern", "path", "plan", "note"):
+        for key in ("content", "old_text", "new_text", "command", "task", "pattern", "path", "plan", "note", "query", "topic"):
             if f"<{key}>" in body:
                 args[key] = Pico.extract_raw(body, key)
 

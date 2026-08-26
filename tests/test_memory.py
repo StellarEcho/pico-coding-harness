@@ -120,3 +120,34 @@ def test_durable_memory_index_and_topic_notes_are_loaded_and_retrieved(tmp_path)
 
     lines = [line for line in memory.retrieval_view("constrained tools", limit=4).splitlines() if line.startswith("- ")]
     assert any("Use constrained tools instead of guessing." in line for line in lines)
+
+
+def test_retrieval_with_metadata_scores_tag_overlap_and_recency():
+    memory = LayeredMemory()
+    memory.append_note("Exact tag note", tags=("recall",), created_at="2026-04-07T10:00:00+00:00")
+    memory.append_note("Keyword overlap note about memory", created_at="2026-04-07T10:01:00+00:00")
+    memory.append_note("Newest unrelated note", created_at="2026-04-07T10:02:00+00:00")
+
+    results = memory.retrieval_with_metadata("recall memory", limit=3)
+
+    assert [item["note"]["text"] for item in results] == ["Exact tag note", "Keyword overlap note about memory"]
+    assert results[0]["score"] > results[1]["score"]
+    assert results[0]["components"]["tag_exact"] == 1
+    assert results[1]["components"]["tag_exact"] == 0
+    assert results[1]["components"]["keyword_overlap"] >= 1
+    assert results[0]["kind"] == "episodic"
+    assert results[0]["source"] == ""
+
+
+def test_durable_add_and_remove_topic_notes(tmp_path):
+    memory = LayeredMemory(workspace_root=tmp_path)
+
+    assert memory.add_durable("project-conventions", "Always run focused tests first.") is True
+    assert memory.add_durable("project-conventions", "Always run focused tests first.") is False
+    assert memory.durable_topics() == ["project-conventions"]
+    notes = memory.durable_store.load_topic_notes("project-conventions")
+    assert [note["text"] for note in notes] == ["Always run focused tests first."]
+
+    assert memory.remove_durable("project-conventions", "Always run focused tests first.") == 1
+    assert memory.remove_durable("project-conventions", "missing note") == 0
+    assert memory.durable_store.load_topic_notes("project-conventions") == []

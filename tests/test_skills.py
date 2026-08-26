@@ -134,6 +134,7 @@ def test_skill_registry_render_and_summary(tmp_path):
         "enabled": 1,
         "ids": ["pytest-runner"],
         "enabled_ids": ["pytest-runner"],
+        "tool_names": ["read_file", "run_shell"],
         "load_errors": [],
     }
 
@@ -157,3 +158,28 @@ def test_pico_loads_workspace_skills_and_reports_them(tmp_path):
     report = agent.run_store.load_report(agent.current_task_state.run_id)
     assert report["skills"]["loaded"] == 1
     assert report["skills"]["ids"] == ["pytest-runner"]
+
+
+def test_pico_merges_skill_tools_into_allowed_tools(tmp_path):
+    (tmp_path / "README.md").write_text("demo\n", encoding="utf-8")
+    _write_skill(tmp_path, "shell-user", _valid_payload(skill_id="shell-user", tools=["run_shell"]))
+    workspace = WorkspaceContext.build(tmp_path)
+    store = SessionStore(tmp_path / ".pico" / "sessions")
+    agent = Pico(
+        model_client=FakeModelClient(["<final>Done.</final>"]),
+        workspace=workspace,
+        session_store=store,
+        approval_policy="auto",
+        allowed_tools=["read_file"],
+    )
+
+    prompt = agent.prompt("Run a command")
+
+    assert "- read_file(" in prompt
+    assert "- run_shell(" in prompt
+    result = agent.run_tool("run_shell", {"command": "echo hi", "timeout": 20})
+    assert "exit_code: 0" in result
+
+    assert agent.ask("Finish") == "Done."
+    report = agent.run_store.load_report(agent.current_task_state.run_id)
+    assert report["skills"]["tool_names"] == ["run_shell"]

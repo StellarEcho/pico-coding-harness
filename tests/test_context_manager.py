@@ -1,5 +1,8 @@
+from datetime import datetime, timedelta, timezone
+
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
 from pico.context_manager import ContextManager
+from pico.features.skills import Skill, SkillRegistry
 
 
 def build_workspace(tmp_path):
@@ -38,6 +41,7 @@ def test_context_manager_assembles_sections_in_expected_order(tmp_path):
         "memory",
         "relevant_memory",
         "plan",
+        "skills",
         "history",
         "current_request",
     ]
@@ -274,6 +278,7 @@ def test_context_manager_renders_plan_between_relevant_memory_and_history(tmp_pa
         "memory",
         "relevant_memory",
         "plan",
+        "skills",
         "history",
         "current_request",
     ]
@@ -361,3 +366,50 @@ def test_context_manager_renders_running_summary_and_skips_older_entries(tmp_pat
     assert "[user] OLD-ENTRY-1" not in transcript
     assert metadata["history"]["summary_lines_count"] == 2
     assert metadata["history"]["summary_chars"] > 0
+
+
+def test_context_manager_renders_skill_fragments_between_plan_and_history(tmp_path):
+    agent = build_agent(tmp_path, [])
+    agent.skills = SkillRegistry(
+        skills=[
+            Skill(
+                skill_id="pytest-runner",
+                version="1.0.0",
+                description="Run and interpret pytest failures.",
+                prompt_fragment="Prefer focused tests before broad suites.",
+            )
+        ]
+    )
+
+    prompt, metadata = ContextManager(agent).build("run the tests")
+
+    assert prompt.index("Plan:") < prompt.index("Skills:") < prompt.index("Transcript:")
+    assert "Prefer focused tests before broad suites." in prompt
+    assert metadata["skills"]["fragment_count"] == 1
+    assert metadata["skills"]["skill_ids"] == ["pytest-runner"]
+    assert metadata["skills"]["rendered_chars"] > 0
+
+
+def test_context_manager_renders_empty_skills_section(tmp_path):
+    agent = build_agent(tmp_path, [])
+
+    prompt, metadata = ContextManager(agent).build("inspect")
+
+    assert "Skills:\n- none" in prompt
+    assert metadata["skills"]["fragment_count"] == 0
+    assert metadata["skills"]["skill_count"] == 0
+
+
+def test_context_manager_reports_retrieval_scores_and_components(tmp_path):
+    agent = build_agent(tmp_path, [])
+    yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+    agent.memory.append_note("Exact tag note", tags=("recall",), created_at=yesterday.isoformat())
+    agent.memory.append_note("Keyword overlap note about memory", created_at=(yesterday + timedelta(minutes=1)).isoformat())
+
+    _, metadata = ContextManager(agent).build("recall memory")
+
+    assert metadata["relevant_memory"]["selected_scores"] == [15, 5]
+    assert metadata["relevant_memory"]["selected_components"] == [
+        {"tag_exact": 1, "keyword_overlap": 1, "recency_band": 3},
+        {"tag_exact": 0, "keyword_overlap": 1, "recency_band": 3},
+    ]

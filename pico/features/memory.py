@@ -6,7 +6,7 @@ session history 负责保存完整事件流；这个模块只保存更小的一�
 """
 
 import hashlib
-from datetime import datetime
+from datetime import datetime, timezone
 import re
 from pathlib import Path
 
@@ -15,6 +15,9 @@ from ..workspace import clip, now
 WORKING_FILE_LIMIT = 8
 EPISODIC_NOTE_LIMIT = 12
 FILE_SUMMARY_LIMIT = 6
+TAG_EXACT_SCORE = 10
+KEYWORD_OVERLAP_SCORE = 2
+KEYWORD_OVERLAP_CAP = 5
 
 DURABLE_TOPIC_DEFAULTS = {
     "project-conventions": {
@@ -223,6 +226,17 @@ class DurableMemoryStore:
             self._write_topic(topic, notes)
         return results, superseded
 
+    def remove_topic_note(self, topic, note_text):
+        if topic not in DURABLE_TOPIC_DEFAULTS:
+            raise ValueError(f"unknown durable topic: {topic}. expected one of: {', '.join(sorted(DURABLE_TOPIC_DEFAULTS))}")
+        notes = [note["text"] for note in self.load_topic_notes(topic)]
+        before = len(notes)
+        filtered = [note for note in notes if note != note_text]
+        if len(filtered) == before:
+            return 0
+        self._write_topic(topic, filtered)
+        return before - len(filtered)
+
 
 def _ensure_list(value):
     if isinstance(value, list):
@@ -290,6 +304,42 @@ def _parse_timestamp(value):
         return datetime.fromisoformat(str(value)).timestamp()
     except Exception:
         return 0.0
+
+
+def _recency_band(value):
+    """把 created_at 映射到 0-3 的新鲜度档位，供混合评分使用。"""
+    timestamp = _parse_timestamp(value)
+    if not timestamp:
+        return 0
+    age_seconds = max(0.0, datetime.now(timezone.utc).timestamp() - timestamp)
+    age_days = age_seconds / 86400.0
+    if age_days <= 7:
+        return 3
+    if age_days <= 30:
+        return 2
+    if age_days <= 365:
+        return 1
+    return 0
+
+
+def _score_note(query_tokens, note):
+    """混合评分：tag 精确命中权重最高，关键词重叠次之，新鲜度最后。"""
+    note_tags = {tag.lower() for tag in note.get("tags", [])}
+    note_tokens = _tokenize(note.get("text", "")) | _tokenize(note.get("source", "")) | note_tags
+    exact_tag_match = int(bool(query_tokens & note_tags))
+    keyword_overlap = len(query_tokens & note_tokens)
+    recency_band = _recency_band(note.get("created_at"))
+    score = (
+        exact_tag_match * TAG_EXACT_SCORE
+        + min(keyword_overlap, KEYWORD_OVERLAP_CAP) * KEYWORD_OVERLAP_SCORE
+        + recency_band
+    )
+    components = {
+        "tag_exact": exact_tag_match,
+        "keyword_overlap": keyword_overlap,
+        "recency_band": recency_band,
+    }
+    return score, components, note_tokens
 
 
 def _normalize_note(note, index):
@@ -516,35 +566,48 @@ def summarize_read_result(result, limit=180):
     return clip(summary, limit)
 
 
-def retrieval_candidates(state, query, limit=3, workspace_root=None):
+def retrieval_candidates_with_metadata(state, query, limit=3, workspace_root=None):
+    """召回候选并返回结构化评分，供 trace/report 观测“为什么召回”。"""
     state = normalize_memory_state(state, workspace_root)
     query_tokens = _tokenize(query)
     ranked = []
     for note in state["episodic_notes"]:
-        # 召回逻辑故意保持简单透明：先看 tag 精确命中，
-        # 再看关键词重叠，最后看新旧程度。这里不引入 embedding。
-        note_tags = {tag.lower() for tag in note.get("tags", [])}
-        note_tokens = _tokenize(note.get("text", "")) | _tokenize(note.get("source", "")) | note_tags
-        exact_tag_match = int(bool(query_tokens & note_tags))
-        keyword_overlap = len(query_tokens & note_tokens)
-        if exact_tag_match == 0 and keyword_overlap == 0:
+        score, components, _ = _score_note(query_tokens, note)
+        if components["tag_exact"] == 0 and components["keyword_overlap"] == 0:
             continue
         recency = _parse_timestamp(note.get("created_at"))
         note_index = int(note.get("note_index", 0))
-        ranked.append(((exact_tag_match, keyword_overlap, recency, note_index), note))
+        ranked.append((score, recency, note_index, note, components))
 
     if workspace_root is not None:
         durable_store = DurableMemoryStore(Path(workspace_root) / ".pico" / "memory")
         for note in durable_store.retrieval_candidates(query, limit=limit):
-            note_tags = {tag.lower() for tag in note.get("tags", [])}
-            note_tokens = _tokenize(note.get("text", "")) | _tokenize(note.get("source", "")) | note_tags
-            exact_tag_match = int(bool(query_tokens & note_tags))
-            keyword_overlap = len(query_tokens & note_tokens)
+            score, components, _ = _score_note(query_tokens, note)
+            if components["tag_exact"] == 0 and components["keyword_overlap"] == 0:
+                continue
             recency = _parse_timestamp(note.get("created_at"))
-            ranked.append(((exact_tag_match, keyword_overlap, recency, -1), note))
+            ranked.append((score, recency, -1, note, components))
 
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    return [note for _, note in ranked[:limit]]
+    ranked.sort(key=lambda item: (item[0], item[1], item[2]), reverse=True)
+    results = []
+    for score, recency, note_index, note, components in ranked[:limit]:
+        results.append(
+            {
+                "note": note,
+                "score": score,
+                "components": components,
+                "source": str(note.get("source", "")).strip(),
+                "kind": str(note.get("kind", "episodic")).strip() or "episodic",
+            }
+        )
+    return results
+
+
+def retrieval_candidates(state, query, limit=3, workspace_root=None):
+    return [
+        item["note"]
+        for item in retrieval_candidates_with_metadata(state, query, limit=limit, workspace_root=workspace_root)
+    ]
 
 
 def retrieval_view(state, query, limit=3, workspace_root=None):
@@ -692,6 +755,9 @@ class LayeredMemory:
     def retrieval_candidates(self, query, limit=3):
         return retrieval_candidates(self.state, query, limit=limit, workspace_root=self.workspace_root)
 
+    def retrieval_with_metadata(self, query, limit=3):
+        return retrieval_candidates_with_metadata(self.state, query, limit=limit, workspace_root=self.workspace_root)
+
     def retrieval_view(self, query, limit=3):
         return retrieval_view(self.state, query, limit=limit, workspace_root=self.workspace_root)
 
@@ -705,3 +771,21 @@ class LayeredMemory:
         promoted, superseded = self.durable_store.promote(promotions)
         self.state = normalize_memory_state(self.state, self.workspace_root)
         return promoted, superseded
+
+    def durable_topics(self):
+        if self.durable_store is None:
+            return []
+        return sorted(self.durable_store.topic_slugs())
+
+    def add_durable(self, topic, note_text):
+        if self.durable_store is None:
+            raise ValueError("durable memory is not available in this backend")
+        if topic not in DURABLE_TOPIC_DEFAULTS:
+            raise ValueError(f"unknown durable topic: {topic}. expected one of: {', '.join(sorted(DURABLE_TOPIC_DEFAULTS))}")
+        promoted, _ = self.promote_durable([(topic, str(note_text).strip())])
+        return bool(promoted)
+
+    def remove_durable(self, topic, note_text):
+        if self.durable_store is None:
+            raise ValueError("durable memory is not available in this backend")
+        return self.durable_store.remove_topic_note(topic, str(note_text).strip())

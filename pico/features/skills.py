@@ -177,6 +177,13 @@ class SkillRegistry:
             hooks.update(skill.memory_hooks)
         return sorted(hooks)
 
+    def hooks_for(self, event):
+        return sorted(
+            skill.skill_id
+            for skill in self.enabled()
+            if str(event) in skill.memory_hooks
+        )
+
     def render(self):
         lines = [f"Skills: {len(self.all())} loaded, {len(self.enabled())} enabled"]
         for skill in self.all():
@@ -196,5 +203,6 @@ class SkillRegistry:
             "enabled": len(self.enabled()),
             "ids": [skill.skill_id for skill in self.all()],
             "enabled_ids": [skill.skill_id for skill in self.enabled()],
+            "tool_names": self.tool_names(),
             "load_errors": list(self.load_errors),
         }

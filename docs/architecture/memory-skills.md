@@ -1,15 +1,17 @@
-# Memory Backends & Skills（M1）
+# Memory Backends & Skills
 
 ## 定位
 
-M1 把两块“可插拔”的接口骨架立起来：
+这一系列改动把“可插拔”落地为三层：
 
 - **MemoryBackend 协议**：runtime 只面向协议编程，默认实现是现有
   `LayeredMemory`（关键词召回），后续 vector / vault 等 backend
   通过注册表接入，不改上层。
 - **Skill 注册表**：声明式 manifest（内置 + 工作区
-  `.pico/skills/*.json`），M1 只负责安全加载、校验和列举，
-  真正的 prompt 注入 / 工具合并 / 事件订阅在 M3 接入。
+  `.pico/skills/*.json`），安全加载、校验、列举，并把 prompt 片段、
+  工具白名单、memory hooks 真正接进 runtime。
+
+## M1：协议与注册表
 
 ## MemoryBackend 协议
 
@@ -43,9 +45,46 @@ M1 把两块“可插拔”的接口骨架立起来：
 
 ## M1 边界
 
-prompt 片段注入、skill 工具合并、memory hooks 事件订阅属于 M3，
-M1 只保证这些能力被安全地校验和枚举。feature flag `skills` 已加入
-默认配置，供后续开关。
+feature flag `skills` 已加入默认配置，供后续开关。
+
+## M2：混合检索评分与观测
+
+`retrieval_candidates` 从“元组排序”升级为显式打分：
+
+- tag 精确命中 +10；
+- 关键词重叠 +2/个（上限 5 个）；
+- 新鲜度档位 +0~3（7 天 / 30 天 / 365 天）；
+- 平局按时间戳与 note_index 决胜。
+
+新增 `retrieval_candidates_with_metadata`（`LayeredMemory.retrieval_with_metadata`），
+每个候选带 `score` 和 `components`。ContextManager 把
+`selected_scores / selected_components` 写进 prompt metadata，
+trace/report 因此可以回答“这轮为什么召回这几条”。
+
+## M3：技能能力点与 durable 工具化
+
+### 技能三能力
+
+- **prompt_fragment**：ContextManager 新增 `skills` section（plan 与
+  history 之间），enabled skill 的片段按预算渲染，参与压缩（优先级
+  高于 plan）。
+- **tools**：skill 声明的工具名自动并入 `allowed_tools` 联合集合；
+  manifest 加载时已保证工具名在 legal 白名单内。
+- **memory_hooks**：`after_tool` / `plan_updated` / `context_compacted`
+  三个事件；runtime 分发并写 `skill_hook_triggered` trace，默认 handler
+  把高价值事件沉淀为 process note。
+
+### durable 记忆工具
+
+新增 `memory_read` / `memory_update` 两个工具（risky=False，feature
+flag `memory` 关闭时隐藏）：
+
+- `memory_read`：召回工作记忆 + durable 记忆；
+- `memory_update`：`action=add|delete`，操作 4 个固定 durable topic，
+  落盘 `.pico/memory/` 的 Markdown 文件。
+
+`LayeredMemory` 增加 `add_durable / remove_durable / durable_topics`，
+`DurableMemoryStore` 增加 `remove_topic_note`。
 
 ## 测试映射
 
@@ -53,3 +92,7 @@ M1 只保证这些能力被安全地校验和枚举。feature flag `skills` 已�
 | --- | --- |
 | `tests/test_memory_backends.py` | 协议一致性、store/retrieve/delete/snapshot、durable、注册表与未知名称 |
 | `tests/test_skills.py` | manifest 校验、错误收集、启用过滤、能力枚举、runtime 加载与 report |
+| `tests/test_memory.py` | 混合评分组件、durable add/remove |
+| `tests/test_tools.py` | memory 工具注册、校验、回调 |
+| `tests/test_context_manager.py` | skills section 渲染与预算、检索分数元数据 |
+| `tests/test_agent_loop.py` | memory 工具集成、feature 开关、三个 skill hook |

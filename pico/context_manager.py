@@ -12,10 +12,12 @@ from dataclasses import dataclass
 
 DEFAULT_TOTAL_BUDGET = 12000
 DEFAULT_SECTION_BUDGETS = {
-    "prefix": 3600,
+    # prefix 会附加 checkpoint 文本，预算需要给工具清单和恢复上下文留余量。
+    "prefix": 4200,
     "memory": 1600,
     "relevant_memory": 1200,
     "plan": 900,
+    "skills": 1200,
     "history": 5200,
 }
 DEFAULT_SECTION_FLOORS = {
@@ -23,12 +25,14 @@ DEFAULT_SECTION_FLOORS = {
     "memory": 400,
     "relevant_memory": 300,
     "plan": 225,
+    "skills": 300,
     "history": 1500,
 }
 # 当 prompt 超预算时，会优先压缩这些 section。
 # plan 放在 history 前面压缩：对多步任务，当前计划比旧历史更值得保留。
-DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "plan", "memory", "prefix")
-SECTION_ORDER = ("prefix", "memory", "relevant_memory", "plan", "history", "current_request")
+# skills 片段是可选指引，压缩优先级高于 plan。
+DEFAULT_REDUCTION_ORDER = ("relevant_memory", "history", "skills", "plan", "memory", "prefix")
+SECTION_ORDER = ("prefix", "memory", "relevant_memory", "plan", "skills", "history", "current_request")
 CURRENT_REQUEST_SECTION = "current_request"
 RELEVANT_MEMORY_LIMIT = 3
 
@@ -120,8 +124,13 @@ class ContextManager:
         if checkpoint_text:
             section_texts["prefix"] = section_texts["prefix"] + "\n\n" + checkpoint_text
         selected_notes = []
+        selected_metadata = []
         if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
-            selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
+            if hasattr(self.agent.memory, "retrieval_with_metadata"):
+                selected_metadata = self.agent.memory.retrieval_with_metadata(user_message, limit=RELEVANT_MEMORY_LIMIT)
+                selected_notes = [item["note"] for item in selected_metadata]
+            else:
+                selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
 
         if not context_reduction_enabled:
             rendered = self._render_sections_without_reduction(section_texts, selected_notes=selected_notes)
@@ -132,6 +141,7 @@ class ContextManager:
                 budgets={section: render.budget for section, render in rendered.items() if section != CURRENT_REQUEST_SECTION},
                 reduction_log=[],
                 selected_notes=selected_notes,
+                selected_metadata=selected_metadata,
                 user_message=user_message,
                 section_texts=section_texts,
             )
@@ -179,6 +189,7 @@ class ContextManager:
             budgets=budgets,
             reduction_log=reduction_log,
             selected_notes=selected_notes,
+            selected_metadata=selected_metadata,
             user_message=user_message,
             section_texts=section_texts,
         )
@@ -193,6 +204,7 @@ class ContextManager:
             relevant_lines.append("- none")
         relevant_raw = "\n".join(relevant_lines)
         plan_raw = self._plan_raw_text()
+        skills_raw = self._skills_raw_text()
         history = list(getattr(self.agent, "session", {}).get("history", []))
         history_raw = self._raw_history_text(history)
         return {
@@ -215,6 +227,12 @@ class ContextManager:
                 budget=len(plan_raw),
                 rendered=plan_raw,
                 details=self._plan_details(),
+            ),
+            "skills": SectionRender(
+                raw=skills_raw,
+                budget=len(skills_raw),
+                rendered=skills_raw,
+                details=self._skills_details(),
             ),
             "history": SectionRender(raw=history_raw, budget=len(history_raw), rendered=history_raw, details={"rendered_entries": []}),
             CURRENT_REQUEST_SECTION: SectionRender(
@@ -244,6 +262,8 @@ class ContextManager:
                 rendered[section] = self._render_relevant_memory(selected_notes or [], int(budget or 0))
             elif section == "plan":
                 rendered[section] = self._render_plan_section(int(budget or 0))
+            elif section == "skills":
+                rendered[section] = self._render_skills_section(int(budget or 0))
             elif section == "history":
                 rendered[section] = self._render_history_section(int(budget or 0))
             else:
@@ -282,6 +302,33 @@ class ContextManager:
             rendered = ""
         else:
             rendered = _tail_clip(raw, int(budget))
+        return SectionRender(raw=raw, budget=int(budget), rendered=rendered, details=details)
+
+    def _skills_raw_text(self):
+        skills = getattr(self.agent, "skills", None)
+        fragments = []
+        if skills is not None:
+            fragments = [str(fragment) for fragment in skills.prompt_fragments() if str(fragment).strip()]
+        if not fragments:
+            return "Skills:\n- none"
+        return "\n".join(["Skills:", *[f"- {fragment}" for fragment in fragments]])
+
+    def _skills_details(self):
+        skills = getattr(self.agent, "skills", None)
+        if skills is None:
+            return {"skill_count": 0, "fragment_count": 0, "skill_ids": []}
+        enabled = skills.enabled()
+        fragments = [str(fragment) for fragment in skills.prompt_fragments() if str(fragment).strip()]
+        return {
+            "skill_count": len(enabled),
+            "fragment_count": len(fragments),
+            "skill_ids": [skill.skill_id for skill in enabled],
+        }
+
+    def _render_skills_section(self, budget):
+        raw = self._skills_raw_text()
+        details = self._skills_details()
+        rendered = _tail_clip(raw, int(budget)) if budget > 0 else ""
         return SectionRender(raw=raw, budget=int(budget), rendered=rendered, details=details)
 
     def _render_relevant_memory(self, selected_notes, budget):
@@ -521,12 +568,23 @@ class ContextManager:
                 rendered["memory"].rendered,
                 rendered["relevant_memory"].rendered,
                 rendered["plan"].rendered,
+                rendered["skills"].rendered,
                 rendered["history"].rendered,
                 rendered[CURRENT_REQUEST_SECTION].rendered,
             ]
         ).strip()
 
-    def _metadata(self, prompt, rendered, budgets, reduction_log, selected_notes, user_message, section_texts):
+    def _metadata(
+        self,
+        prompt,
+        rendered,
+        budgets,
+        reduction_log,
+        selected_notes,
+        user_message,
+        section_texts,
+        selected_metadata=None,
+    ):
         section_metadata = {}
         for section in SECTION_ORDER[:-1]:
             section_metadata[section] = {
@@ -557,6 +615,8 @@ class ContextManager:
                 "selected_notes": [note["text"] for note in selected_notes],
                 "selected_sources": [str(note.get("source", "")).strip() for note in selected_notes],
                 "selected_kinds": [str(note.get("kind", "episodic")).strip() or "episodic" for note in selected_notes],
+                "selected_scores": [int(item.get("score", 0) or 0) for item in (selected_metadata or [])],
+                "selected_components": [dict(item.get("components", {}) or {}) for item in (selected_metadata or [])],
                 "selected_durable_count": sum(
                     1 for note in selected_notes if (str(note.get("kind", "episodic")).strip() or "episodic") == "durable"
                 ),
@@ -582,6 +642,13 @@ class ContextManager:
                 "next_pending": rendered["plan"].details.get("next_pending"),
                 "raw_chars": rendered["plan"].raw_chars,
                 "rendered_chars": rendered["plan"].rendered_chars,
+            },
+            "skills": {
+                "skill_count": int(rendered["skills"].details.get("skill_count", 0) or 0),
+                "fragment_count": int(rendered["skills"].details.get("fragment_count", 0) or 0),
+                "skill_ids": list(rendered["skills"].details.get("skill_ids", []) or []),
+                "raw_chars": rendered["skills"].raw_chars,
+                "rendered_chars": rendered["skills"].rendered_chars,
             },
             "current_request": {
                 "text": user_message,

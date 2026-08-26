@@ -16,6 +16,8 @@ class ToolContext:
     # 计划工具的回调。由 runtime 注入，这样 tools.py 不需要反向依赖 runtime。
     # 后续其他“纯内存”工具（例如 memory/skill 操作）可以按同样方式扩展。
     plan_update: Callable[[dict], str] | None = None
+    memory_query: Callable[[dict], str] | None = None
+    memory_update: Callable[[dict], str] | None = None
 
     def path(self, raw_path):
         return self.path_resolver(str(raw_path))

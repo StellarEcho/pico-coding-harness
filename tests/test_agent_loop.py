@@ -335,3 +335,121 @@ def test_compaction_feature_disabled_ignores_policy(tmp_path):
     assert agent.compact_history(trigger="manual") is None
     prompt = agent.prompt("Continue")
     assert "- summary:" not in prompt
+
+
+def test_agent_loop_uses_memory_read_and_memory_update_tools(tmp_path):
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"memory_update","args":{"action":"add","topic":"project-conventions","note":"Run focused tests first."}}</tool>',
+            '<tool>{"name":"memory_read","args":{"query":"focused tests","limit":3}}</tool>',
+            "<final>Done.</final>",
+        ],
+    )
+
+    assert agent.ask("Remember the convention") == "Done."
+
+    notes = agent.memory.durable_store.load_topic_notes("project-conventions")
+    assert [note["text"] for note in notes] == ["Run focused tests first."]
+    tool_events = [item for item in agent.session["history"] if item["role"] == "tool"]
+    assert tool_events[0]["name"] == "memory_update"
+    assert "Run focused tests first." in tool_events[1]["content"]
+
+
+def test_memory_feature_disabled_hides_memory_tools(tmp_path):
+    agent = build_agent(tmp_path, [], feature_flags={"memory": False})
+
+    prompt = agent.prompt("Inspect memory")
+
+    assert "- memory_read(" not in prompt
+    assert "- memory_update(" not in prompt
+    assert agent.run_tool("memory_read", {"query": "x"}) == "error: unknown tool 'memory_read'"
+
+
+def _write_skill(root, payload):
+    skills_dir = root / ".pico" / "skills"
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    (skills_dir / f"{payload['skill_id']}.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_skill_after_tool_hook_fires_on_tool_error(tmp_path):
+    _write_skill(
+        tmp_path,
+        {
+            "skill_id": "watcher",
+            "version": "1.0.0",
+            "description": "Watch tool outcomes.",
+            "memory_hooks": ["after_tool"],
+        },
+    )
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"read_file","args":{"path":"missing.txt","start":1,"end":1}}</tool>',
+            "<final>Done.</final>",
+        ],
+    )
+
+    assert agent.ask("Read the missing file") == "Done."
+
+    notes = agent.memory.to_dict()["episodic_notes"]
+    assert any("skill after_tool:" in note["text"] for note in notes)
+    trace_path = agent.run_store.trace_path(agent.current_task_state)
+    trace_events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert any(
+        event["event"] == "skill_hook_triggered" and event.get("skill_id") == "watcher" and event.get("hook_event") == "after_tool"
+        for event in trace_events
+    )
+
+
+def test_skill_plan_updated_hook_fires(tmp_path):
+    _write_skill(
+        tmp_path,
+        {
+            "skill_id": "planner-watcher",
+            "version": "1.0.0",
+            "description": "Watch plan updates.",
+            "memory_hooks": ["plan_updated"],
+        },
+    )
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"update_plan","args":{"action":"init","title":"Fix tests","plan":"1. Reproduce\\n2. Patch"}}</tool>',
+            "<final>Done.</final>",
+        ],
+    )
+
+    assert agent.ask("Fix the tests") == "Done."
+
+    notes = agent.memory.to_dict()["episodic_notes"]
+    assert any("skill plan_updated:" in note["text"] for note in notes)
+
+
+def test_skill_context_compacted_hook_fires(tmp_path):
+    _write_skill(
+        tmp_path,
+        {
+            "skill_id": "compaction-watcher",
+            "version": "1.0.0",
+            "description": "Watch compactions.",
+            "memory_hooks": ["context_compacted"],
+        },
+    )
+    agent = build_agent(tmp_path, [])
+    for index in range(8):
+        agent.record(
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"entry-{index}-" + ("B" * 120),
+                "created_at": f"2026-04-07T10:{index:02d}:00+00:00",
+            }
+        )
+    state = TaskState.create(task_id="task_hook", user_request="Compact")
+    agent.current_task_state = state
+    agent.current_run_dir = agent.run_store.start_run(state)
+
+    agent.compact_history(trigger="manual")
+
+    notes = agent.memory.to_dict()["episodic_notes"]
+    assert any("skill context_compacted:" in note["text"] for note in notes)

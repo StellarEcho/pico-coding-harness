@@ -261,6 +261,15 @@ class AgentLoop:
                         **dict(tool_result.metadata or {}),
                     },
                 )
+                agent.dispatch_skill_hooks(
+                    "after_tool",
+                    {
+                        "name": name,
+                        "args": args,
+                        "result": result,
+                        "metadata": dict(tool_result.metadata or {}),
+                    },
+                )
                 # 兜底：模型连续执行工具却始终不建计划时，
                 # runtime 自动生成占位计划，下一轮 prompt 就能看到。
                 # 阈值可配置（plan_auto_init_after），模型已建过计划则跳过。

@@ -9,6 +9,7 @@ import subprocess
 import textwrap
 from functools import partial
 
+from .features.memory import DURABLE_TOPIC_DEFAULTS
 from .workspace import IGNORED_PATH_NAMES
 
 BASE_TOOL_SPECS = {
@@ -58,6 +59,16 @@ BASE_TOOL_SPECS = {
             "action=update: mark step_id as done/blocked/in_progress/skipped."
         ),
     },
+    "memory_read": {
+        "schema": {"query": "str", "limit": "int=3"},
+        "risky": False,
+        "description": "Retrieve relevant notes from working and durable memory.",
+    },
+    "memory_update": {
+        "schema": {"topic": "str", "note": "str", "action": "str='add'"},
+        "risky": False,
+        "description": "Add or remove a durable memory note (action=add|delete).",
+    },
 }
 
 DELEGATE_TOOL_SPEC = {
@@ -78,6 +89,8 @@ TOOL_EXAMPLES = {
     "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
     "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
     "update_plan": '<tool>{"name":"update_plan","args":{"action":"init","title":"Fix failing tests","plan":"1. Reproduce the failure\\n2. Locate the faulty code\\n3. Patch the implementation\\n4. Run pytest"}}</tool>',
+    "memory_read": '<tool>{"name":"memory_read","args":{"query":"deploy conventions","limit":3}}</tool>',
+    "memory_update": '<tool>{"name":"memory_update","args":{"action":"add","topic":"project-conventions","note":"Always run focused tests first."}}</tool>',
     "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
 }
 
@@ -186,6 +199,26 @@ def validate_tool(context, name, args):
             raise ValueError("plan update requires a positive step_id")
         if not str(args.get("status", "") or "").strip():
             raise ValueError("plan update requires a status")
+        return
+
+    if name == "memory_read":
+        query = str(args.get("query", "") or "").strip()
+        if not query:
+            raise ValueError("query must not be empty")
+        limit = int(args.get("limit", 3))
+        if limit < 1 or limit > 10:
+            raise ValueError("limit must be in [1, 10]")
+        return
+
+    if name == "memory_update":
+        action = str(args.get("action", "add") or "add").strip()
+        if action not in {"add", "delete"}:
+            raise ValueError("action must be 'add' or 'delete'")
+        topic = str(args.get("topic", "") or "").strip()
+        if topic not in DURABLE_TOPIC_DEFAULTS:
+            raise ValueError(f"topic must be one of: {', '.join(sorted(DURABLE_TOPIC_DEFAULTS))}")
+        if not str(args.get("note", "") or "").strip():
+            raise ValueError("note must not be empty")
         return
 
 
@@ -318,6 +351,18 @@ def tool_update_plan(context, args):
     return context.plan_update(args)
 
 
+def tool_memory_read(context, args):
+    if context.memory_query is None:
+        raise ValueError("memory feature is disabled")
+    return context.memory_query(args)
+
+
+def tool_memory_update(context, args):
+    if context.memory_update is None:
+        raise ValueError("memory feature is disabled")
+    return context.memory_update(args)
+
+
 _TOOL_RUNNERS = {
     "list_files": tool_list_files,
     "read_file": tool_read_file,
@@ -326,4 +371,6 @@ _TOOL_RUNNERS = {
     "write_file": tool_write_file,
     "patch_file": tool_patch_file,
     "update_plan": tool_update_plan,
+    "memory_read": tool_memory_read,
+    "memory_update": tool_memory_update,
 }
