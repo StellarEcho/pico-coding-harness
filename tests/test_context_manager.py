@@ -336,3 +336,28 @@ def test_context_manager_reduces_plan_section_under_budget_pressure(tmp_path):
     assert "plan" in reduction_sections
     assert metadata["sections"]["plan"]["rendered_chars"] <= metadata["sections"]["plan"]["budget_chars"]
     assert "keep this request verbatim" in prompt
+
+
+def test_context_manager_renders_running_summary_and_skips_older_entries(tmp_path):
+    agent = build_agent(tmp_path, [])
+    for minute in range(1, 9):
+        agent.record(
+            {
+                "role": "user" if minute % 2 == 1 else "assistant",
+                "content": f"OLD-ENTRY-{minute}-" + ("D" * 120),
+                "created_at": f"2026-04-07T09:{minute:02d}:00+00:00",
+            }
+        )
+    agent.session["compaction"]["summary_entries"] = [
+        "user: OLD-ENTRY-1 folded",
+        "assistant: OLD-ENTRY-2 folded",
+    ]
+
+    prompt, metadata = ContextManager(agent).build("inspect the transcript")
+    transcript = prompt.split("\n\nTranscript:\n", 1)[1].split("\n\nCurrent user request:", 1)[0]
+
+    assert transcript.count("- summary:") == 2
+    assert "- summary: user: OLD-ENTRY-1 folded" in transcript
+    assert "[user] OLD-ENTRY-1" not in transcript
+    assert metadata["history"]["summary_lines_count"] == 2
+    assert metadata["history"]["summary_chars"] > 0

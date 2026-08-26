@@ -4,6 +4,7 @@ import pytest
 
 from pico import FakeModelClient, Pico, SessionStore, WorkspaceContext
 from pico.agent_loop import AgentLoop
+from pico.task_state import TaskState
 
 
 def build_agent(tmp_path, outputs, **kwargs):
@@ -228,3 +229,109 @@ def test_plan_feature_disabled_hides_update_plan_tool(tmp_path):
     assert "- update_plan(" not in prompt
     result = agent.run_tool("update_plan", {"action": "init", "title": "T", "plan": "1. A"})
     assert result == "error: unknown tool 'update_plan'"
+
+
+def test_agent_loop_compacts_history_on_step_interval(tmp_path):
+    (tmp_path / "sample.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+    agent = build_agent(
+        tmp_path,
+        [
+            '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
+            '<tool>{"name":"search","args":{"pattern":"demo","path":"."}}</tool>',
+            '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":1}}</tool>',
+            '<tool>{"name":"search","args":{"pattern":"alpha","path":"."}}</tool>',
+            '<tool>{"name":"read_file","args":{"path":"sample.txt","start":1,"end":2}}</tool>',
+            '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
+            '<tool>{"name":"search","args":{"pattern":"beta","path":"."}}</tool>',
+            "<final>Done.</final>",
+        ],
+        max_steps=8,
+    )
+    agent.compaction_policy.step_interval = 2
+    agent.compaction_policy.recent_window = 6
+
+    answer = agent.ask("Inspect the repo")
+
+    assert answer == "Done."
+    prompts = agent.model_client.prompts
+    assert "- summary: user: Inspect the repo" in prompts[6]
+    assert "[tool:list_files]" in prompts[6]
+
+    trace_path = agent.run_store.trace_path(agent.current_task_state)
+    trace_events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    compact_events = [event for event in trace_events if event["event"] == "context_compacted"]
+    assert any(event.get("trigger") == "step_interval" for event in compact_events)
+    assert any(event.get("entries_folded") == 1 for event in compact_events)
+
+    # 非破坏性：session history 仍然完整（user + 7 条工具 + 最终 assistant 回答）
+    assert len(agent.session["history"]) == 9
+    report = agent.run_store.load_report(agent.current_task_state.run_id)
+    assert report["compaction"]["triggers"]["step_interval"] >= 1
+    assert report["compaction"]["summary_lines"] >= 1
+
+
+def test_agent_loop_compacts_history_on_budget_pressure(tmp_path):
+    agent = build_agent(tmp_path, ["<final>Done.</final>"])
+    agent.context_manager.total_budget = 600
+    agent.compaction_policy.threshold = 0.8
+    for index in range(8):
+        agent.record(
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"history-{index}-" + ("A" * 260),
+                "created_at": f"2026-04-07T10:{index:02d}:00+00:00",
+            }
+        )
+
+    assert agent.ask("Continue the long task") == "Done."
+
+    prompts = agent.model_client.prompts
+    assert "- summary: user: history-0-" in prompts[0]
+    assert "- summary: assistant: history-1-" in prompts[0]
+    trace_path = agent.run_store.trace_path(agent.current_task_state)
+    trace_events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert any(event["event"] == "context_compacted" and event.get("trigger") == "budget_pressure" for event in trace_events)
+
+
+def test_runtime_manual_compact_writes_session_and_trace(tmp_path):
+    agent = build_agent(tmp_path, [])
+    for index in range(8):
+        agent.record(
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"entry-{index}-" + ("B" * 120),
+                "created_at": f"2026-04-07T10:{index:02d}:00+00:00",
+            }
+        )
+    state = TaskState.create(task_id="task_compact", user_request="Compact")
+    agent.current_task_state = state
+    agent.current_run_dir = agent.run_store.start_run(state)
+
+    decision = agent.compact_history(trigger="manual")
+
+    assert decision is not None
+    assert decision.trigger == "manual"
+    assert decision.entries_folded == 2
+    assert agent.session["compaction"]["summarized_through"] == 2
+    trace_path = agent.run_store.trace_path(state)
+    trace_events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert any(event["event"] == "context_compacted" and event.get("trigger") == "manual" for event in trace_events)
+
+
+def test_compaction_feature_disabled_ignores_policy(tmp_path):
+    agent = build_agent(tmp_path, ["<final>Done.</final>"], feature_flags={"compaction": False})
+    agent.context_manager.total_budget = 600
+    for index in range(8):
+        agent.record(
+            {
+                "role": "user" if index % 2 == 0 else "assistant",
+                "content": f"entry-{index}-" + ("B" * 120),
+                "created_at": f"2026-04-07T10:{index:02d}:00+00:00",
+            }
+        )
+    agent.session["compaction"]["summary_entries"] = ["user: stale summary"]
+
+    assert agent.maybe_compact({}, 0) is None
+    assert agent.compact_history(trigger="manual") is None
+    prompt = agent.prompt("Continue")
+    assert "- summary:" not in prompt

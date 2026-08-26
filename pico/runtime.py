@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import checkpoint as checkpointlib
+from . import compaction as compactionlib
 from .features import memory as memorylib
 from . import planner as plannerlib
 from . import security as securitylib
@@ -34,6 +35,7 @@ DEFAULT_FEATURE_FLAGS = {
     "context_reduction": True,
     "prompt_cache": True,
     "plan": True,
+    "compaction": True,
 }
 DURABLE_MEMORY_INTENT_PATTERN = re.compile(r"(?i)\b(capture|remember|save|store|persist|note)\b")
 DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(r"(记住|保存|记录|沉淀|长期记忆|持久记忆)")
@@ -100,6 +102,8 @@ class Pico:
         self._ensure_session_shape()
         self.plan = plannerlib.PlanManager(self.session["plan"])
         self.session["plan"] = self.plan.to_dict()
+        self.estimator = compactionlib.TokenEstimator()
+        self.compaction_policy = compactionlib.CompactionPolicy(estimator=self.estimator)
         self.memory = memorylib.LayeredMemory(
             self.session.setdefault("memory", memorylib.default_memory_state()),
             workspace_root=self.root,
@@ -139,6 +143,7 @@ class Pico:
         self.session.setdefault("history", [])
         self.session.setdefault("memory", memorylib.default_memory_state())
         self.session.setdefault("plan", plannerlib.default_plan_state())
+        self.session.setdefault("compaction", compactionlib.default_compaction_state())
         checkpoints = self.session.setdefault("checkpoints", {})
         if not isinstance(checkpoints, dict):
             checkpoints = {}
@@ -215,6 +220,43 @@ class Pico:
         self.session["plan"] = self.plan.to_dict()
         self.session_path = self.session_store.save(self.session)
         return rendered
+
+    def compact_history(self, trigger="manual"):
+        """执行一次上下文压缩，写 session 和 trace，返回 decision 或 None。"""
+        if not self.feature_enabled("compaction"):
+            return None
+        state = self.session.setdefault("compaction", compactionlib.default_compaction_state())
+        new_state, decision = self.compaction_policy.compact(self.session["history"], state, trigger)
+        self.session["compaction"] = new_state
+        self.session_path = self.session_store.save(self.session)
+        if self.current_task_state is not None:
+            self.emit_trace(self.current_task_state, "context_compacted", decision.to_dict())
+        return decision
+
+    def maybe_compact(self, prompt_metadata, tool_steps):
+        """按策略评估是否在发请求前压缩；命中则执行并返回 decision。"""
+        if not self.feature_enabled("compaction"):
+            return None
+        history_len = len(self.session["history"])
+        trigger = self.compaction_policy.evaluate(
+            prompt_metadata,
+            tool_steps=tool_steps,
+            history_len=history_len,
+        )
+        if not trigger:
+            return None
+        return self.compact_history(trigger=trigger)
+
+    def calibrate_token_estimator(self, input_chars, input_tokens):
+        """用 provider 返回的实际 usage 校准 token 估算。"""
+        self.estimator.calibrate(input_chars, input_tokens)
+
+    def compaction_stats(self):
+        state = self.session.get("compaction", {}) or {}
+        stats = dict(state.get("stats", {}) or {})
+        stats["summary_chars"] = len("\n".join(state.get("summary_entries", []) or []))
+        stats["summary_lines"] = len(state.get("summary_entries", []) or [])
+        return stats
 
     def auto_init_plan(self, user_message):
         """模型一直不调用 update_plan 时，runtime 兜底生成占位计划。
@@ -382,6 +424,7 @@ class Pico:
                 "workspace_chars": len(self.workspace.text()),
                 "memory_chars": len(self.memory_text()),
                 "history_chars": len(self.history_text()),
+                "history_len": len(self.session["history"]),
                 "request_chars": len(user_message),
                 "tool_count": len(self.tools),
                 "workspace_docs": len(self.workspace.project_docs),
@@ -631,6 +674,7 @@ class Pico:
             "durable_rejections": list(self.last_durable_rejections),
             "durable_superseded": list(self.last_durable_superseded),
             "plan": self.plan.metrics(),
+            "compaction": self.compaction_stats(),
             "redacted_env": self.detected_secret_env_summary(),
         }
 
@@ -835,6 +879,7 @@ class Pico:
         self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
         self.plan.reset()
         self.session["plan"] = self.plan.to_dict()
+        self.session["compaction"] = compactionlib.default_compaction_state()
         self.session_store.save(self.session)
 
     def path(self, raw_path):

@@ -79,6 +79,8 @@ class AgentLoop:
             prompt_metadata.update(completion_metadata)
         agent.last_completion_metadata = completion_metadata
         agent.last_prompt_metadata = prompt_metadata
+        if completion_metadata.get("input_tokens"):
+            agent.calibrate_token_estimator(len(prompt), completion_metadata.get("input_tokens"))
         kind, payload = agent.parse(raw)
         agent.emit_trace(
             task_state,
@@ -204,6 +206,21 @@ class AgentLoop:
                     {
                         "checkpoint_id": checkpoint["checkpoint_id"],
                         "trigger": "context_reduction",
+                    },
+                )
+            # 上下文压缩：命中策略后先压缩再重建 prompt，
+            # 让模型这一轮就看到折叠后的摘要，而不是下轮才生效。
+            compaction_decision = agent.maybe_compact(prompt_metadata, tool_steps)
+            if compaction_decision is not None:
+                prompt, prompt_metadata = agent._build_prompt_and_metadata(user_message)
+                prompt_metadata["compaction"] = compaction_decision.to_dict()
+                agent.emit_trace(
+                    task_state,
+                    "prompt_built",
+                    {
+                        "prompt_metadata": prompt_metadata,
+                        "duration_ms": 0,
+                        "purpose": "after_compaction",
                     },
                 )
             raw, kind, payload = self._request_model(

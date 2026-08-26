@@ -353,39 +353,56 @@ class ContextManager:
                     "collapsed_duplicate_reads": 0,
                     "reused_file_summary_count": 0,
                     "summarized_tool_count": 0,
+                    "summary_lines_count": 0,
+                    "summary_chars": 0,
                 },
             )
 
         # 优先保留最近的历史，因为下一步决策通常最依赖刚刚发生的工具结果。
         recent_window = 6
         recent_start = max(0, len(history) - recent_window)
-        history_entries, history_details = self._compressed_history_entries(history, recent_start)
+        summary_entries = self._history_summary_entries()
+        summary_lines = [f"- summary: {line}" for line in summary_entries]
+        summary_text = "\n".join(summary_lines)
+        # 有运行摘要时，窗口外的条目已经折叠进摘要，渲染时跳过；
+        # 摘要本身占用固定开销，先从这个 section 的预算里扣除。
+        entries_budget = budget
+        if summary_text:
+            entries_budget = max(20, budget - (len(summary_text) + 1))
+        history_entries, history_details = self._compressed_history_entries(
+            history,
+            recent_start,
+            skip_older=bool(summary_text),
+        )
         rendered_entries = []
         for entry in reversed(history_entries):
             recent = bool(entry.get("recent", False))
             candidate_lines = list(entry.get("lines", []))
             candidate_entries = candidate_lines + rendered_entries
             candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
-            if len(candidate_rendered) <= budget:
+            if len(candidate_rendered) <= entries_budget:
                 rendered_entries = candidate_entries
                 continue
             if recent:
-                available = budget - len("Transcript:")
+                available = entries_budget - len("Transcript:")
                 if rendered_entries:
                     available -= sum(len(line) + 1 for line in rendered_entries)
                 available = max(20, available - 1)
                 candidate_lines = [_tail_clip(line, available) for line in candidate_lines]
                 candidate_entries = candidate_lines + rendered_entries
                 candidate_rendered = "\n".join(["Transcript:", *candidate_entries])
-                if len(candidate_rendered) <= budget:
+                if len(candidate_rendered) <= entries_budget:
                     rendered_entries = candidate_entries
             else:
                 smaller_lines = [_tail_clip(line, 20) for line in candidate_lines]
                 smaller_entries = smaller_lines + rendered_entries
                 smaller_rendered = "\n".join(["Transcript:", *smaller_entries])
-                if len(smaller_rendered) <= budget:
+                if len(smaller_rendered) <= entries_budget:
                     rendered_entries = smaller_entries
-        rendered = "\n".join(["Transcript:", *rendered_entries])
+        if summary_text:
+            rendered = "\n".join(["Transcript:", summary_text, *rendered_entries])
+        else:
+            rendered = "\n".join(["Transcript:", *rendered_entries])
 
         if len(rendered) > budget and budget > 0:
             rendered = _tail_clip(raw, budget)
@@ -398,11 +415,19 @@ class ContextManager:
                 "recent_window": recent_window,
                 "recent_start": recent_start,
                 "rendered_entries": rendered_entries,
+                "summary_lines_count": len(summary_entries),
+                "summary_chars": len(summary_text),
                 **history_details,
             },
         )
 
-    def _compressed_history_entries(self, history, recent_start):
+    def _history_summary_entries(self):
+        if not self.agent.feature_enabled("compaction"):
+            return []
+        state = getattr(self.agent, "session", {}).get("compaction", {}) or {}
+        return [str(line) for line in state.get("summary_entries", []) or [] if str(line).strip()]
+
+    def _compressed_history_entries(self, history, recent_start, skip_older=False):
         entries = []
         seen_older_reads = set()
         details = {
@@ -422,6 +447,9 @@ class ContextManager:
                         "lines": self._render_history_item(item, line_limit),
                     }
                 )
+                continue
+            if skip_older:
+                # 窗口外的条目已经由 compaction 折叠进运行摘要，这里不再重复渲染。
                 continue
 
             if item["role"] == "tool" and item["name"] == "read_file":
@@ -544,6 +572,8 @@ class ContextManager:
                 "collapsed_duplicate_reads": int(rendered["history"].details.get("collapsed_duplicate_reads", 0)),
                 "reused_file_summary_count": int(rendered["history"].details.get("reused_file_summary_count", 0)),
                 "summarized_tool_count": int(rendered["history"].details.get("summarized_tool_count", 0)),
+                "summary_lines_count": int(rendered["history"].details.get("summary_lines_count", 0) or 0),
+                "summary_chars": int(rendered["history"].details.get("summary_chars", 0) or 0),
             },
             "plan": {
                 "title": str(rendered["plan"].details.get("title", "") or ""),
