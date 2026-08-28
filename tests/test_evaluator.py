@@ -1,4 +1,5 @@
 import json
+import locale as locale_module
 from pathlib import Path
 from collections import Counter
 
@@ -115,7 +116,9 @@ def test_run_fixed_benchmark_reports_metadata_and_success_definition(tmp_path):
         "max_new_tokens": 64,
     }
     assert reproducibility["timezone"] == "Asia/Shanghai"
-    assert reproducibility["locale"] == "C.UTF-8"
+    # locale 是运行环境的可复现性元数据，断言它等于当前进程的实际值，
+    # 而不是硬编码某台机器的 locale，否则测试在不同终端上会不稳定。
+    assert reproducibility["locale"] == locale_module.setlocale(locale_module.LC_CTYPE)
 
     for row in artifact["rows"]:
         assert not row["fixture_copy_relpath"].startswith("/")
